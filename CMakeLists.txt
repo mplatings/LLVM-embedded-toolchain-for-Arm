@@ -377,10 +377,11 @@ set(library_variants)
 # Add to the library_variants list libraries that share a common parent
 # directory and type of C library.
 # See after the function for examples of how it is used.
-function(add_library_variants parent_dir_name libc_type)
+function(add_library_variants sysroot libc_type)
+    set(multilib_file_contents)
     set(variant_args "${ARGN}")
     while(variant_args)
-        list(POP_FRONT variant_args target_arch variant_suffix flags qemu_params)
+        list(POP_FRONT variant_args parent_dir target_arch variant_suffix compile_flags multilib_flags qemu_params)
 
         if(variant_suffix)
             set(variant "${target_arch}_${variant_suffix}")
@@ -397,69 +398,85 @@ function(add_library_variants parent_dir_name libc_type)
             endif()
         endif()
 
-        list(APPEND library_variants "${parent_dir_name}" "${libc_type}" "${target_arch}" "${variant}" "${flags}" "${qemu_params}")
+        if(target_arch STREQUAL "aarch64")
+            set(target "aarch64-none-elf")
+        else()
+            # Choose the target triple so that compiler-rt will do the
+            # right thing. We can't always put the exact target
+            # architecture in the triple, because compiler-rt's cmake
+            # system doesn't recognize every possible Arm architecture
+            # version. So mostly we just say 'arm' and control the arch
+            # version via -march=armv7m (or whatever).
+            # Exceptions are architectures pre-armv7, which compiler-rt expects to
+            # see in the triple because that's where it looks to decide whether to
+            # use specific assembly sources.
+            if(target_arch MATCHES "^armv[4-6]")
+                set(target "${target_arch}-none-eabi")
+            else()
+                set(target "arm-none-eabi")
+            endif()
+            if(compile_flags MATCHES "-mfloat-abi=hard")
+                # Also, compiler-rt looks in the ABI component of the
+                # triple to decide whether to use the hard float ABI.
+                set(target "${target}hf")
+            endif()
+        endif()
+
+        set(multilib_dir "${parent_dir}/${variant}")
+
+        list(APPEND library_variants "${sysroot}/${multilib_dir}" "${libc_type}" "${target}" "${variant}" "${compile_flags}" "${qemu_params}")
+
+        string(REPLACE " " ", " multilib_flags "${multilib_flags}")
+        string(REPLACE " " ", " compile_flags "${compile_flags}")
+        string(APPEND multilib_file_contents "- dir: ${multilib_dir}
+  flags: [${multilib_flags}]
+  printArgs: [--target=${target}, ${compile_flags}]
+")
     endwhile()
+
+    if(multilib_file_contents)
+        set(multilib_filepath "${LLVM_BINARY_DIR}/${sysroot}/multilib.yaml")
+        configure_file(cmake/multilib.yaml.in "${multilib_filepath}" @ONLY)
+        install(FILES
+            "${multilib_filepath}"
+            DESTINATION "${sysroot}"
+            COMPONENT llvm-toolchain
+        )
+    endif()
 
     set(library_variants "${library_variants}" PARENT_SCOPE)
 endfunction()
 
 # Define which library variants to build and which flags to use.
-# The order is <arch> <name suffix> <flags>
-add_library_variants(aarch64-none-elf picolibc
-    aarch64         ""                  "-march=armv8-a"                                        "-M raspi3b"
-)
-add_library_variants(arm-none-eabi picolibc
-    armv4t          ""                  "-march=armv4t"                                         "-M musicpal -cpu arm926"
-    armv5te         ""                  "-march=armv5te"                                        "-M musicpal -cpu arm926"
-    armv6m          soft_nofp           "-mfloat-abi=soft -march=armv6m"                        "-M microbit"
-    armv7em         hard_fpv4_sp_d16    "-mfloat-abi=hard -march=armv7em -mfpu=fpv4-sp-d16"     "-M mps2-an386 -cpu cortex-m4"
-    armv7em         hard_fpv5_d16       "-mfloat-abi=hard -march=armv7em -mfpu=fpv5-d16"        "-M mps2-an500 -cpu cortex-m7"
-    armv7em         soft_nofp           "-mfloat-abi=soft -march=armv7em -mfpu=none"            "-M mps2-an386 -cpu cortex-m4"
-    armv7m          soft_nofp           "-mfloat-abi=soft -march=armv7m+nofp"                   "-M mps2-an385 -cpu cortex-m3"
-    armv8m.main     hard_fp             "-mfloat-abi=hard -march=armv8m.main+fp"                "-M mps3-an524 -cpu cortex-m33"
-    armv8m.main     soft_nofp           "-mfloat-abi=soft -march=armv8m.main+nofp"              "-M mps2-an505 -cpu cortex-m33"
-    armv8.1m.main   hard_fp             "-mfloat-abi=hard -march=armv8.1m.main+fp"              "-M mps3-an547 -cpu cortex-m55"
-    armv8.1m.main   hard_nofp_mve       "-mfloat-abi=hard -march=armv8.1m.main+nofp+mve"        "-M mps3-an547 -cpu cortex-m55"
-    armv8.1m.main   soft_nofp_nomve     "-mfloat-abi=soft -march=armv8.1m.main+nofp+nomve"      "-M mps3-an547 -cpu cortex-m55"
+# The order is <parent directory> <target arch> <suffix> <compile flags> <multilib flags> <QEMU params>
+add_library_variants(lib/clang-runtimes picolibc
+    aarch64-none-elf aarch64    ""                  "-march=armv8-a"                                    "target=aarch64-none-unknown-elf"                       "-M raspi3b"
+    arm-none-eabi armv4t        ""                  "-mfloat-abi=softfp -march=armv4t"                  "target=armv4t-none-unknown-eabi"                       "-M musicpal -cpu arm926"
+    arm-none-eabi armv5te       ""                  "-mfloat-abi=softfp -march=armv5te"                 "target=armv5e-none-unknown-eabi"                       "-M musicpal -cpu arm926"
+    arm-none-eabi armv6m        soft_nofp           "-mfloat-abi=soft -march=armv6m"                    "target=thumbv6m-none-unknown-eabi"                     "-M microbit"
+    arm-none-eabi armv7m        soft_nofp           "-mfloat-abi=soft -march=armv7m+nofp"               "target=thumbv7m-none-unknown-eabi"                     "-M mps2-an385 -cpu cortex-m3"
+    arm-none-eabi armv7em       soft_nofp           "-mfloat-abi=soft -march=armv7em -mfpu=none"        "target=thumbv7em-none-unknown-eabi"                    "-M mps2-an386 -cpu cortex-m4"
+    arm-none-eabi armv7em       hard_fpv4_sp_d16    "-mfloat-abi=hard -march=armv7em -mfpu=fpv4-sp-d16" "target=thumbv7em-none-unknown-eabihf hasfpu"           "-M mps2-an386 -cpu cortex-m4"
+    arm-none-eabi armv7em       hard_fpv5_d16       "-mfloat-abi=hard -march=armv7em -mfpu=fpv5-d16"    "target=thumbv7em-none-unknown-eabihf mfpu=fpv5-d16"    "-M mps2-an500 -cpu cortex-m7"
+    arm-none-eabi armv8m.main   soft_nofp           "-mfloat-abi=soft -march=armv8m.main+nofp"          "target=thumbv8m.main-none-unknown-eabi"                "-M mps2-an505 -cpu cortex-m33"
+    arm-none-eabi armv8m.main   hard_fp             "-mfloat-abi=hard -march=armv8m.main+fp"            "target=thumbv8m.main-none-unknown-eabihf hasfpu"       "-M mps3-an524 -cpu cortex-m33"
+    arm-none-eabi armv8.1m.main soft_nofp_nomve     "-mfloat-abi=soft -march=armv8.1m.main+nofp+nomve"  "target=thumbv8.1m.main-none-unknown-eabi"              "-M mps3-an547 -cpu cortex-m55"
+    arm-none-eabi armv8.1m.main hard_fp             "-mfloat-abi=hard -march=armv8.1m.main+fp"          "target=thumbv8.1m.main-none-unknown-eabihf hasfpu"     "-M mps3-an547 -cpu cortex-m55"
+    arm-none-eabi armv8.1m.main hard_nofp_mve       "-mfloat-abi=hard -march=armv8.1m.main+nofp+mve"    "target=thumbv8.1m.main-none-unknown-eabihf march=+mve" "-M mps3-an547 -cpu cortex-m55"
 )
 
 add_custom_target(check-picolibc)
 set(library_variants_copy "${library_variants}")
 # Destructively iterate over a copy of the tuples defining the variants.
 while(library_variants_copy)
-    list(POP_FRONT library_variants_copy parent_dir_name libc_type target_arch variant flags qemu_params)
+    list(POP_FRONT library_variants_copy directory libc_type target variant flags qemu_params)
 
-    if(target_arch STREQUAL "aarch64")
-        set(target "aarch64-none-elf")
+    if(target MATCHES "aarch64")
         set(cpu_family aarch64)
     else()
-        # Choose the target triple so that compiler-rt will do the
-        # right thing. We can't always put the exact target
-        # architecture in the triple, because compiler-rt's cmake
-        # system doesn't recognize every possible Arm architecture
-        # version. So mostly we just say 'arm' and control the arch
-        # version via -march=armv7m (or whatever).
-        # Exceptions are architectures pre-armv7, which compiler-rt expects to
-        # see in the triple because that's where it looks to decide whether to
-        # use specific assembly sources.
-        if(target_arch MATCHES "^armv[4-6]")
-            set(target "${target_arch}-none-eabi")
-        elseif(flags MATCHES "-mfloat-abi=hard")
-            # Also, compiler-rt looks in the ABI component of the
-            # triple to decide whether to use the hard float ABI.
-            #
-            # (Of course, there is no case that requires both armv6m
-            # _and_ eabihf, because v6-M never has hardware FP.)
-            set(target "arm-none-eabihf")
-        else()
-            # The default case, with any other AArch32 architecture
-            # version and the default soft float ABI.
-            set(target "arm-none-eabi")
-        endif()
         set(cpu_family arm)
     endif()
-    set(variant_directory "${parent_dir_name}/${variant}")
-    set(install_directory "${LLVM_BINARY_DIR}/lib/clang-runtimes/${variant_directory}")
+    set(install_directory "${LLVM_BINARY_DIR}/${directory}")
     set(common_flags "--target=${target} ${flags}")
 
     # Create clang configuration files
@@ -583,7 +600,7 @@ while(library_variants_copy)
             )
             add_dependencies(check-picolibc_${variant} check-picolibc_${variant}-${test})
         endfunction()
-        if(target_arch MATCHES "^(armv8|aarch64)")
+        if(flags MATCHES "-march=armv8")
             message("Picolibc tests disabled for ${variant}")
         else()
             execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory picolibc_tests_${variant})
@@ -717,8 +734,8 @@ while(library_variants_copy)
     )
 
     install(
-        DIRECTORY ${install_directory}
-        DESTINATION lib/clang-runtimes/${parent_dir_name}
+        DIRECTORY "${install_directory}/"
+        DESTINATION "${directory}"
         COMPONENT llvm-toolchain
     )
 endwhile()
